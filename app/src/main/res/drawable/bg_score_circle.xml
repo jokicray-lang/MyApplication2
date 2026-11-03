@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="oval">
+    <!-- 默认灰色，实际颜色会在代码中根据分数改变 -->
+    <solid android:color="#AAAAAA" />
+    <size android:width="60dp" android:height="60dp"/>
+</shape>

@@ -1,0 +1,14 @@
+<resources>
+    <string name="app_name">My Application</string>
+    <string-array name="exercise_types">
+        <item>深蹲</item>
+        <item>俯卧撑</item>
+        <item>仰卧起坐</item>
+        <item>二头弯举</item>
+        <item>侧平举</item>
+        <item>站姿推举</item>
+        <item>抬腿</item>
+        <item>提膝</item>
+        <item>腿举</item>
+    </string-array>
+</resources>
