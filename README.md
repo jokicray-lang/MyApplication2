@@ -2,7 +2,24 @@
 
 用手机摄像头记录一组健身动作。选好动作后，应用会在预览画面上叠加人体骨架，通过关节角度的变化计算次数，并在完成一次有效动作时播放提示音。训练结束后可以在手机上查看记录。
 
-## 记录一次训练
+[技术栈](#技术栈) · [使用方法](#使用方法) · [技术实现](#技术实现) · [构建与运行](#构建与运行) · [项目结构](#项目结构)
+
+## 技术栈
+
+| 层次 | 技术与版本 | 在项目中的用途 |
+| --- | --- | --- |
+| 语言与平台 | Kotlin 2.0.21、Android SDK | Kotlin 编写应用逻辑。最低支持 Android 7.0（API 24），编译和目标 SDK 均为 34。 |
+| 界面 | Android XML、ConstraintLayout 2.1.4、View Binding | XML 定义训练页布局，主界面通过 View Binding 访问相机预览、计数文本和训练按钮。 |
+| 相机采集 | CameraX 1.3.1 | 同时提供实时预览和用于姿态检测的图像帧，支持前后摄像头切换。 |
+| 姿态检测 | Google ML Kit Pose Detection Accurate 18.0.0-beta5 | 提取人体关节点，供 Kotlin 计数器按所选动作计算角度和次数。 |
+| 运动反馈 | Android Canvas、SoundPool | 自定义视图在预览上绘制骨架，有效动作计数后播放提示音。 |
+| 持久化 | Room 2.6.1、Kotlin 协程与 Flow | 协程写入训练记录。历史页订阅查询结果，通过 RecyclerView 展示。 |
+| 测试 | JUnit 4.13.2、AndroidX Test JUnit 1.1.5 | 现有示例分别验证本地算术断言和设备上的应用包名。 |
+| 构建 | Gradle 8.13、Android Gradle Plugin 8.13.2 | 用 Kotlin DSL 配置 Android 模块，通过 Gradle Wrapper 构建 APK，使用 kapt 生成 Room 的数据库访问代码。 |
+
+库版本取自应用模块的依赖声明，插件和 Gradle 版本分别见版本目录和 Wrapper 配置。[应用依赖](app/build.gradle.kts) · [插件版本](gradle/libs.versions.toml) · [Gradle Wrapper](gradle/wrapper/gradle-wrapper.properties)
+
+## 使用方法
 
 1. 打开应用，允许使用相机。默认使用后置摄像头，也可以点「切换镜头」。调整手机位置，让动作涉及的关节出现在画面里。
 2. 从下拉菜单选择动作，点「开始训练」。例如练深蹲时，让髋、膝、踝都进入画面，再开始下蹲。
@@ -11,13 +28,13 @@
 
 ## 技术实现
 
-### 从相机画面到人体骨架
+### 相机采集与骨架绘制
 
 1. **采集。** `MainActivity.startCamera()` 用 CameraX 1.3.1 把预览和图像分析绑定到页面生命周期。预览直接显示在 `PreviewView` 上，分析任务通过单线程执行器接收 `ImageProxy`。如果检测速度跟不上摄像头，`STRATEGY_KEEP_ONLY_LATEST` 会保留最新的待分析帧，因此下文的“五帧”指实际参与计算的五帧。
 2. **提取关节点。** `processImage()` 将图像和旋转角度封装为 `InputImage`，送入 ML Kit 的高精度姿态检测器（`18.0.0-beta5`，`STREAM_MODE`）。检测结果按关键点编号填入 33 个位置，每个位置保存二维坐标 `(x, y)`。用户在菜单里所选的动作决定随后使用哪几个关节。
 3. **绘制和计数。** `OverlayView` 将坐标等比缩放并居中，用点标出关节，用线连接肩、肘、腕、髋、膝和踝。预览阶段就会绘制骨架。点击「开始训练」后，同一组关键点才会交给 `ExerciseCounter.process()`。没有检测到人体时，界面清空骨架并跳过该帧的计数。[相机和训练流程](app/src/main/java/com/example/myapplication/MainActivity.kt) · [骨架绘制](app/src/main/java/com/example/myapplication/OverlayView.kt)
 
-### 从三个关节点到一次动作
+### 动作判定与角度阈值
 
 `calculateAngle(A, B, C)` 以中间的关节 B 为顶点，用向量 BA、BC 的叉积与点积计算夹角，结果在 0° 到 180° 之间。例如“肩、肘、腕”测量的是肘关节在画面中的弯曲程度。当前实现只使用二维坐标，也没有按关键点置信度筛选。身体侧转或关节被遮挡时，同一个动作可能得到不同的角度。
 
@@ -37,7 +54,7 @@
 
 前六种动作先对同一帧的左右角度取平均，再对最近最多五帧取平均，用平滑后的角度判断阶段和追踪极值。抬腿、提膝和腿举则直接使用左右两侧的原始角度，各自维护阶段，共用计时器。每帧先检查左侧，左侧触发时跳过右侧判定，因此同一帧最多加一次。评分用的极值由两侧共享，每帧取更接近目标角度的一侧更新极值。
 
-### 如何打分，以及为什么会漏计
+### 评分规则与漏计示例
 
 计数器逐帧追踪角度极值，到达评分条件时，计算该极值和目标角度的绝对差 `d`。当 `d ≤ 10°` 时得 100 分。超出 10° 的部分每度扣 2 分，舍去小数，最低为 0 分。85–100 分为绿色，60–84 分为黄色，这两档都会加一次。低于 60 分为红色，次数不变。每次判定都会更新时间并重置极值，因此红色结果也会启动下一次判定前的 500 毫秒间隔。总次数仍为零时，界面的数字评分保持 `--`，文字提示仍会更新。
 
@@ -48,7 +65,7 @@
 
 如果要新增动作，先在 `exercise_types` 菜单和 `configs` 中使用同一个中文名称，再为左右两侧各选三个关节点，设置两个阶段的阈值，以及评分时取最小角还是最大角。可以先画出一次动作的角度变化，检查极值出现在评分之前还是之后。上面的弯举和深蹲例子说明，这个先后顺序会直接影响计数。[菜单资源](app/src/main/res/values/strings.xml) · [动作配置](app/src/main/java/com/example/myapplication/ExerciseCounter.kt)
 
-### 一组训练怎样写入历史
+### 训练记录与历史查询
 
 点击「结束并保存」时，`MainActivity` 读取当前次数和屏幕分数。次数为零时跳过保存，手动加减后的次数也会参与判断。Room 2.6.1 通过挂起函数向本地数据库 `exercise_app_db` 的 `exercise_records` 表写入**一组一条**的记录。[记录实体](app/src/main/java/com/example/myapplication/database/ExerciseRecord.kt) · [数据库操作](app/src/main/java/com/example/myapplication/database/ExerciseDao.kt)
 
@@ -63,7 +80,7 @@
 
 结束训练还会独立发起一个 HTTP POST 请求，只发送动作类型和次数，例如 `{"type":"深蹲","count":8}`。当前地址 `http://YOUR_SERVER_IP:8080/api/save_record` 是占位符，仓库未提供服务端。页面的「数据已保存」提示在触发保存后立即显示，没有等待数据库写入或服务器响应。本地写入是否成功，可以在历史页查看。[保存和请求逻辑](app/src/main/java/com/example/myapplication/MainActivity.kt)
 
-## 在 Android Studio 中运行
+## 构建与运行
 
 1. 获取源码并在 Android Studio 中打开包含 `settings.gradle.kts` 的目录。
 
@@ -83,7 +100,7 @@
 
 生成的 APK 位于 `app/build/outputs/apk/debug/app-debug.apk`。
 
-## 仓库文件怎么读
+## 项目结构
 
 | 路径 | 用途 |
 | --- | --- |
