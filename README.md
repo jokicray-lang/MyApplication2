@@ -9,18 +9,59 @@
 3. 训练时查看次数、动作阶段、评分和文字提示。可以用 `+` 和 `−` 手动校正次数，或用「重置」清零。
 4. 点「结束并保存」。次数大于零时，应用会保存动作名称、次数、结束时显示的分数和时间。点「查看历史记录」可以按从新到旧的顺序查看每一组。
 
-| 动作 | 用来计算角度的三个关节点 |
+## 技术实现
+
+### 从相机画面到人体骨架
+
+1. **采集。** `MainActivity.startCamera()` 用 CameraX 1.3.1 把预览和图像分析绑定到页面生命周期。预览直接显示在 `PreviewView` 上，分析任务通过单线程执行器接收 `ImageProxy`。如果检测速度跟不上摄像头，`STRATEGY_KEEP_ONLY_LATEST` 会保留最新的待分析帧，因此下文的“五帧”指实际参与计算的五帧。
+2. **提取关节点。** `processImage()` 将图像和旋转角度封装为 `InputImage`，送入 ML Kit 的高精度姿态检测器（`18.0.0-beta5`，`STREAM_MODE`）。检测结果按关键点编号填入 33 个位置，每个位置保存二维坐标 `(x, y)`。用户在菜单里所选的动作决定随后使用哪几个关节。
+3. **绘制和计数。** `OverlayView` 将坐标等比缩放并居中，用点标出关节，用线连接肩、肘、腕、髋、膝和踝。预览阶段就会绘制骨架。点击「开始训练」后，同一组关键点才会交给 `ExerciseCounter.process()`。没有检测到人体时，界面清空骨架并跳过该帧的计数。[相机和训练流程](app/src/main/java/com/example/myapplication/MainActivity.kt) · [骨架绘制](app/src/main/java/com/example/myapplication/OverlayView.kt)
+
+### 从三个关节点到一次动作
+
+`calculateAngle(A, B, C)` 以中间的关节 B 为顶点，用向量 BA、BC 的叉积与点积计算夹角，结果在 0° 到 180° 之间。例如“肩、肘、腕”测量的是肘关节在画面中的弯曲程度。当前实现只使用二维坐标，也没有按关键点置信度筛选。身体侧转或关节被遮挡时，同一个动作可能得到不同的角度。
+
+当角度满足表中的 `up` 条件，计数器会记住这个阶段。当角度随后满足同一行的评分条件，并且距上次判定**超过 500 毫秒**，才进入 `down` 并评分。两个阶段是代码里的状态名，具体对应抬起还是放下，要看所选动作。以下阈值均为源码中的严格不等式。[动作配置和状态转换](app/src/main/java/com/example/myapplication/ExerciseCounter.kt)
+
+| 动作 | 关节点（中间为顶点） | 先进入 `up` | 随后触发评分 | 评分目标 |
+| --- | --- | ---: | ---: | --- |
+| 深蹲 | 髋、膝、踝 | > 160° | < 110° | 最小膝角 70° |
+| 俯卧撑 | 肩、肘、腕 | > 160° | < 110° | 最小肘角 70° |
+| 仰卧起坐 | 肩、髋、膝 | < 80° | > 140° | 最小髋角 50° |
+| 二头弯举 | 肩、肘、腕 | < 60° | > 160° | 最小肘角 40° |
+| 侧平举 | 髋、肩、肘 | > 80° | < 30° | 最大肩角 90° |
+| 站姿推举 | 肩、肘、腕 | > 150° | < 90° | 最大肘角 170° |
+| 抬腿 | 肩、髋、膝 | < 110° | > 160° | 最小髋角 90° |
+| 提膝 | 肩、髋、膝 | < 90° | > 160° | 最小髋角 60° |
+| 腿举 | 髋、膝、踝 | > 160° | < 100° | 最小膝角 70° |
+
+前六种动作先对同一帧的左右角度取平均，再对最近最多五帧取平均，用平滑后的角度判断阶段和追踪极值。抬腿、提膝和腿举则直接使用左右两侧的原始角度，各自维护阶段，共用计时器。每帧先检查左侧，左侧触发时跳过右侧判定，因此同一帧最多加一次。评分用的极值由两侧共享，每帧取更接近目标角度的一侧更新极值。
+
+### 如何打分，以及为什么会漏计
+
+计数器逐帧追踪角度极值，到达评分条件时，计算该极值和目标角度的绝对差 `d`。当 `d ≤ 10°` 时得 100 分。超出 10° 的部分每度扣 2 分，舍去小数，最低为 0 分。85–100 分为绿色，60–84 分为黄色，这两档都会加一次。低于 60 分为红色，次数不变。每次判定都会更新时间并重置极值，因此红色结果也会启动下一次判定前的 500 毫秒间隔。总次数仍为零时，界面的数字评分保持 `--`，文字提示仍会更新。
+
+- **一次得到 90 分的弯举。** 假设平滑后的肘角从 165° 降到 55°，再伸回 165°。55° 已进入弯举的 `up` 阶段，伸回时才触发评分。若这段时间记录到的最小角就是 55°，与 40° 目标相差 15°，得分为 `100 − (15 − 10) × 2 = 90`，显示绿色并计一次。若最小角为 60°，单凭这一角度还进不了 `up`，因为入口条件是严格小于 60°。
+- **深蹲为什么可能漏计。** 假设已经站直进入 `up`，平滑膝角缓慢降到 109° 就触发评分。若截至此时记录的最小值也是 109°，与 70° 目标相差 39°，得分为 42，显示红色。这时阶段已切换到 `down`，即使继续下蹲到 70°，这次下蹲也不会重新评分。
+
+界面上的动作建议由动作名称和角度差选择。例如“保持背部挺直”是一条预设提示，评分逻辑本身只比较表中对应的关节角度。[评分和提示实现](app/src/main/java/com/example/myapplication/ExerciseCounter.kt)
+
+如果要新增动作，先在 `exercise_types` 菜单和 `configs` 中使用同一个中文名称，再为左右两侧各选三个关节点，设置两个阶段的阈值，以及评分时取最小角还是最大角。可以先画出一次动作的角度变化，检查极值出现在评分之前还是之后。上面的弯举和深蹲例子说明，这个先后顺序会直接影响计数。[菜单资源](app/src/main/res/values/strings.xml) · [动作配置](app/src/main/java/com/example/myapplication/ExerciseCounter.kt)
+
+### 一组训练怎样写入历史
+
+点击「结束并保存」时，`MainActivity` 读取当前次数和屏幕分数。次数为零时跳过保存，手动加减后的次数也会参与判断。Room 2.6.1 通过挂起函数向本地数据库 `exercise_app_db` 的 `exercise_records` 表写入**一组一条**的记录。[记录实体](app/src/main/java/com/example/myapplication/database/ExerciseRecord.kt) · [数据库操作](app/src/main/java/com/example/myapplication/database/ExerciseDao.kt)
+
+| 字段 | 内容 |
 | --- | --- |
-| 深蹲、腿举 | 髋、膝、踝 |
-| 俯卧撑、二头弯举、站姿推举 | 肩、肘、腕 |
-| 仰卧起坐、抬腿、提膝 | 肩、髋、膝 |
-| 侧平举 | 髋、肩、肘 |
+| `id` | 自动生成的主键 |
+| `type`、`count` | 结束时选中的动作名称和最终次数 |
+| `score` | 结束时屏幕上的分数，显示 `--` 时存 0。每组只保存这一个分数。 |
+| `timestamp` | 保存时的时间戳，单位为毫秒 |
 
-## 计数和评分
+历史页订阅 DAO 返回的 `Flow<List<ExerciseRecord>>`。查询按 `timestamp DESC` 排序，列表随数据库变化刷新。页面使用 `RecyclerView` 显示每组的动作、日期、次数和分数，空列表显示「暂无记录」。[历史页](app/src/main/java/com/example/myapplication/HistoryActivity.kt) · [列表适配器](app/src/main/java/com/example/myapplication/HistoryAdapter.kt)
 
-CameraX 提供实时画面，ML Kit 从画面提取人体关键点，`ExerciseCounter` 根据用户所选动作计算关节角度。以深蹲为例，程序对左右膝角取平均，再对最近五帧取平均。膝角先大于 160°、再小于 110°，且与上次判定相隔超过 500 毫秒时，就会计算一次评分。
-
-评分取决于判定时已观测到的极值角度与目标角度之间的差距。例如深蹲的目标膝角为 70°。85 分及以上显示绿色，60 至 84 分显示黄色，低于 60 分显示红色。只有绿色和黄色的动作会增加自动计数。由于深蹲在跨过下蹲阈值时就评分，慢速下蹲可能在到达最低点之前被判为低分。历史记录保存的是结束时的屏幕分数，一组内的各次评分没有单独存储。
+结束训练还会独立发起一个 HTTP POST 请求，只发送动作类型和次数，例如 `{"type":"深蹲","count":8}`。当前地址 `http://YOUR_SERVER_IP:8080/api/save_record` 是占位符，仓库未提供服务端。页面的「数据已保存」提示在触发保存后立即显示，没有等待数据库写入或服务器响应。本地写入是否成功，可以在历史页查看。[保存和请求逻辑](app/src/main/java/com/example/myapplication/MainActivity.kt)
 
 ## 在 Android Studio 中运行
 
@@ -54,13 +95,3 @@ CameraX 提供实时画面，ML Kit 从画面提取人体关键点，`ExerciseCo
 | [gradlew](gradlew) | macOS 和 Linux 的 Gradle Wrapper 启动脚本。 |
 | [gradlew.bat](gradlew.bat) | Windows 的 Gradle Wrapper 启动脚本。 |
 | [settings.gradle.kts](settings.gradle.kts) | 配置插件和依赖仓库，并将 `app` 加入构建。 |
-
-如果想跟着一帧相机画面读代码，可以按以下顺序阅读。
-
-1. 相机画面进入姿态检测器，训练按钮决定是否启用计数。[MainActivity.kt](app/src/main/java/com/example/myapplication/MainActivity.kt)
-2. 检测到的关节点被画到预览画面上。[OverlayView.kt](app/src/main/java/com/example/myapplication/OverlayView.kt)
-3. 计数器按所选动作计算角度，判断是否计数并返回分数和提示。[ExerciseCounter.kt](app/src/main/java/com/example/myapplication/ExerciseCounter.kt)
-
-Room 将训练记录保存在手机上，历史页读取记录并按时间倒序显示。[数据库实现](app/src/main/java/com/example/myapplication/database/) · [历史页](app/src/main/java/com/example/myapplication/HistoryActivity.kt)
-
-源码还预留了向服务器发送动作类型和次数的入口，默认地址包含占位符 `YOUR_SERVER_IP`。仓库未包含服务端，查看本地历史无需配置服务器。
